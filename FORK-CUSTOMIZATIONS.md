@@ -51,14 +51,14 @@
 
 ### 3. CI 产物构建 workflow
 
-- **commit**: `a8aab7a0 ci: add build-artifacts workflow (frontend + docker image as GitHub artifacts)`
+- **commit**: `a8aab7a0 ci: add build-artifacts workflow (frontend + docker image as GitHub artifacts)`（后续迭代：`dbde2c17` 修复磁盘导出、`75af618b`、`GHCR 推送`）
 - **说明**: 在 fork 仓库新增 `build-artifacts` workflow，手动触发或 push 到 `main` / 打 `v*` tag 时：
   - 构建前端静态产物（`web/dist`），上传 Artifact `frontend-dist`
-  - 构建完整 Docker 镜像，导出为 tar.gz，上传 Artifact `new-api-docker-image`
-  - 产物下载后自行使用：`docker load -i new-api-image.tar.gz`
+  - 构建完整 Docker 镜像并推送到 **GHCR**：`ghcr.io/lihongjing-2023/new-api:<版本>` 及 `:latest`
+  - 使用方式：`docker pull ghcr.io/lihongjing-2023/new-api:latest`（首次需在仓库 Packages 设置公开可见）
 - **涉及文件**:
   - `.github/workflows/build-artifacts.yml`（新增）
-- **同步上游注意事项**: 上游官方仓库同名目录下无此 workflow，无冲突。
+- **同步上游注意事项**: 上游官方仓库同名目录下无此 workflow，无冲突。注意 GHCR 需要 `permissions.packages: write`。
 
 ---
 
