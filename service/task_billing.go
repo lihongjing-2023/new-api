@@ -10,9 +10,11 @@ import (
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
+	"github.com/shopspring/decimal"
 )
 
 // LogTaskConsumption 记录任务消费日志和统计信息（仅记录，不涉及实际扣费）。
@@ -257,6 +259,12 @@ func RecalculateTaskQuota(ctx context.Context, task *model.Task, actualQuota int
 	other["task_id"] = task.TaskID
 	other["pre_consumed_quota"] = preConsumedQuota
 	other["actual_quota"] = actualQuota
+	if trafficFeeUSD := operation_setting.GetTrafficFee(); trafficFeeUSD > 0 {
+		other["traffic_fee"] = trafficFeeUSD
+		if bc := task.PrivateData.BillingContext; bc != nil && bc.GroupRatio > 0 {
+			other["traffic_fee_quota"] = common.QuotaFromDecimal(TrafficFeeQuotaDecimal(bc.GroupRatio))
+		}
+	}
 	for _, clamp := range clamps {
 		attachQuotaSaturationToOther(other, clamp)
 	}
@@ -319,8 +327,12 @@ func RecalculateTaskQuotaByTokens(ctx context.Context, task *model.Task, totalTo
 		otherMultiplier = priceData.OtherRatioMultiplier()
 	}
 
-	// 计算实际应扣费额度: totalTokens * modelRatio * groupRatio * otherMultiplier（饱和转换，防止溢出成负数）
-	actualQuota, clamp := common.QuotaFromFloatChecked(float64(totalTokens) * modelRatio * finalGroupRatio * otherMultiplier)
+	// 计算实际应扣费额度: totalTokens * modelRatio * groupRatio * otherMultiplier
+	// （饱和转换，防止溢出成负数），并按量计费结算统一追加固定流量费
+	actualQuota, clamp := common.QuotaFromDecimalChecked(
+		decimal.NewFromFloat(float64(totalTokens) * modelRatio * finalGroupRatio * otherMultiplier).
+			Add(TrafficFeeQuotaDecimal(finalGroupRatio)),
+	)
 
 	reason := fmt.Sprintf("token重算：tokens=%d, modelRatio=%.2f, groupRatio=%.2f, otherMultiplier=%.4f", totalTokens, modelRatio, finalGroupRatio, otherMultiplier)
 	RecalculateTaskQuota(ctx, task, actualQuota, reason, clamp)

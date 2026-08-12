@@ -207,6 +207,11 @@ export interface LogOtherData {
   file_search_call_count?: number
   file_search_price?: number
   tool_surcharges?: ToolSurchargeItem[]
+  // Per-request fixed surcharge (USD) applied at final billing.
+  // traffic_fee_quota is the equivalent internal quota points for cross-checking.
+  // Only present when the configured traffic fee is positive.
+  traffic_fee?: number
+  traffic_fee_quota?: number
   audio_input_seperate_price?: boolean
   audio_input_token_count?: number
   audio_input_price?: number

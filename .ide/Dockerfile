@@ -10,8 +10,11 @@
 #   - make（项目 makefile 构建入口依赖）
 FROM cnbcool/default-dev-env:latest
 
-# 安装 make / gcc（Go 依赖下载与本地编译所需，模板镜像未预装 make）
-RUN apt-get update && apt-get install -y --no-install-recommends make gcc && \
+# 安装构建工具链：build-essential 提供 gcc/g++/make 及 libc6-dev（C 头文件，
+# Go 的 cgo 编译必需 stdint.h/stdlib.h 等，模板镜像未预装）；
+# unzip 供 Bun 安装脚本解压使用；curl/ca-certificates 用于下载 Go 与 Bun
+RUN apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    build-essential curl ca-certificates unzip && \
     rm -rf /var/lib/apt/lists/*
 
 # 安装 Go 1.26.1（官方预编译二进制，按架构下载解压到 /usr/local/go）
@@ -30,9 +33,15 @@ RUN ARCH=$(dpkg --print-architecture 2>/dev/null || uname -m) && \
 ENV PATH="/usr/local/go/bin:${PATH}"
 
 # 安装 Bun（前端包管理器，1.x 与 web/bun.lock 兼容；安装脚本由 GitHub Releases 分发）
-RUN curl -fsSL https://bun.sh/install | bash
+# 显式验证版本：管道中安装脚本失败时退出码可能仍为 0，须在构建期暴露问题
+RUN curl -fsSL https://bun.sh/install | bash && \
+    /root/.bun/bin/bun --version
 ENV BUN_INSTALL="/root/.bun" \
     PATH="/root/.bun/bin:${PATH}"
+
+# 字符集：支持命令行中文输入（官方推荐配置）
+ENV LANG C.UTF-8
+ENV LANGUAGE C.UTF-8
 
 # CNB 会将仓库挂载到 /workspace，作为统一工作目录
 WORKDIR /workspace

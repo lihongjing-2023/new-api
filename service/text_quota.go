@@ -201,15 +201,25 @@ func noteQuotaClamp(relayInfo *relaycommon.RelayInfo, clamp *common.QuotaClamp) 
 }
 
 func composeTieredTextQuota(relayInfo *relaycommon.RelayInfo, summary textQuotaSummary, tieredQuota int, tieredResult *billingexpr.TieredResult) int {
+	trafficFee := TrafficFeeQuotaDecimal(summary.GroupRatio)
+
 	if summary.ToolCallSurchargeQuota.IsZero() {
-		return tieredQuota
+		if trafficFee.IsZero() {
+			return tieredQuota
+		}
+		total, clamp := common.QuotaFromDecimalChecked(
+			decimal.NewFromInt(int64(tieredQuota)).Add(trafficFee),
+		)
+		noteQuotaClamp(relayInfo, clamp)
+		return total
 	}
 
 	if tieredResult != nil {
 		if snap := relayInfo.TieredBillingSnapshot; snap != nil {
 			quota, clamp := common.QuotaFromDecimalChecked(decimal.NewFromFloat(tieredResult.ActualQuotaBeforeGroup).
 				Mul(decimal.NewFromFloat(snap.GroupRatio)).
-				Add(summary.ToolCallSurchargeQuota))
+				Add(summary.ToolCallSurchargeQuota).
+				Add(trafficFee))
 			noteQuotaClamp(relayInfo, clamp)
 			return quota
 		}
@@ -219,7 +229,7 @@ func composeTieredTextQuota(relayInfo *relaycommon.RelayInfo, summary textQuotaS
 	// MaxQuota and adding the surcharge could push the total past the int32
 	// quota policy bound (persisted quota columns are 32-bit).
 	total, clamp := common.QuotaFromDecimalChecked(
-		decimal.NewFromInt(int64(tieredQuota)).Add(summary.ToolCallSurchargeQuota),
+		decimal.NewFromInt(int64(tieredQuota)).Add(summary.ToolCallSurchargeQuota).Add(trafficFee),
 	)
 	noteQuotaClamp(relayInfo, clamp)
 	return total
@@ -358,6 +368,7 @@ func calculateTextQuotaSummary(ctx *gin.Context, relayInfo *relaycommon.RelayInf
 		quotaCalculateDecimal = quotaCalculateDecimal.Add(audioInputQuota)
 		quotaCalculateDecimal = relayInfo.PriceData.ApplyOtherRatiosToDecimal(quotaCalculateDecimal)
 		quotaCalculateDecimal = quotaCalculateDecimal.Add(summary.ToolCallSurchargeQuota)
+		quotaCalculateDecimal = quotaCalculateDecimal.Add(TrafficFeeQuotaDecimal(summary.GroupRatio)) // +traffic fee
 
 		if !ratio.IsZero() && quotaCalculateDecimal.LessThanOrEqual(decimal.Zero) {
 			quotaCalculateDecimal = decimal.NewFromInt(1)
@@ -516,6 +527,13 @@ func PostTextConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, us
 		// reliable total input value and tagged the usage source. Do not infer it from
 		// prompt/cache fields here, otherwise old upstream payloads may be double-counted.
 		other["input_tokens_total"] = billingUsage.InputTokens
+	}
+	if trafficFeeUSD := operation_setting.GetTrafficFee(); trafficFeeUSD > 0 {
+		// traffic_fee: per-request fixed surcharge (USD) applied at final billing.
+		// traffic_fee_quota: equivalent internal quota points for cross-checking.
+		// Both fields are only written when the configured fee is positive.
+		other["traffic_fee"] = trafficFeeUSD
+		other["traffic_fee_quota"] = common.QuotaFromDecimal(TrafficFeeQuotaDecimal(summary.GroupRatio))
 	}
 	if tieredBillingApplied {
 		InjectTieredBillingInfo(other, relayInfo, tieredResult)

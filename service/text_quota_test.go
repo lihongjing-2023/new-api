@@ -684,6 +684,41 @@ func TestComposeTieredTextQuotaErrorFallbackUsesPreConsumedQuota(t *testing.T) {
 	require.Equal(t, 14500, quota)
 }
 
+func TestComposeTieredTextQuotaAddsTrafficFee(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	w := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(w)
+
+	oldFee := operation_setting.GetTrafficFee()
+	operation_setting.SetTrafficFeeForTest(0.001)
+	t.Cleanup(func() { operation_setting.SetTrafficFeeForTest(oldFee) })
+
+	relayInfo := &relaycommon.RelayInfo{
+		OriginModelName: "o1",
+		PriceData: hosttypes.PriceData{
+			ModelRatio:      1,
+			CompletionRatio: 1,
+			GroupRatioInfo:  hosttypes.GroupRatioInfo{GroupRatio: 2},
+		},
+		TieredBillingSnapshot: &billingexpr.BillingSnapshot{
+			BillingMode:               "tiered_expr",
+			GroupRatio:                2,
+			EstimatedQuotaBeforeGroup: 1000,
+		},
+		StartTime: time.Now(),
+	}
+	usage := &dto.Usage{PromptTokens: 100, CompletionTokens: 50, TotalTokens: 150}
+
+	summary := calculateTextQuotaSummary(ctx, relayInfo, usage)
+	// No tool surcharge: pure tiered result + traffic fee.
+	quota := composeTieredTextQuota(relayInfo, summary, 1000, &billingexpr.TieredResult{
+		ActualQuotaBeforeGroup: 1000,
+		ActualQuotaAfterGroup:  2000,
+	})
+	// traffic fee: 0.001 * 500000 * 2 = 1000
+	require.Equal(t, 2000, quota)
+}
+
 // TestTryTieredSettleRecordsClampOnOverflow guards that an oversized tiered
 // settlement both saturates the quota and records the clamp on RelayInfo, so
 // every consume path (text, audio, WSS) can surface it under admin_info.
@@ -1042,6 +1077,57 @@ func TestCalculateTextQuotaSummaryImageGenerationUsesStructuredSurcharge(t *test
 	assert.True(t, expectedSurcharge.Equal(summary.ToolCallSurchargeQuota),
 		"got %s want %s", summary.ToolCallSurchargeQuota, expectedSurcharge)
 	assert.Greater(t, summary.Quota, 0)
+}
+
+func TestCalculateTextQuotaSummaryAddsTrafficFeeToPerTokenBilling(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+
+	oldFee := operation_setting.GetTrafficFee()
+	operation_setting.SetTrafficFeeForTest(0.001)
+	t.Cleanup(func() { operation_setting.SetTrafficFeeForTest(oldFee) })
+
+	relayInfo := &relaycommon.RelayInfo{
+		OriginModelName: "gpt-4o",
+		PriceData: hosttypes.PriceData{
+			ModelRatio:      1,
+			CompletionRatio: 2,
+			GroupRatioInfo:  hosttypes.GroupRatioInfo{GroupRatio: 1},
+		},
+		StartTime: time.Now(),
+	}
+	usage := &dto.Usage{PromptTokens: 10, CompletionTokens: 5, TotalTokens: 15}
+
+	summary := calculateTextQuotaSummary(ctx, relayInfo, usage)
+
+	// token fee: (10 + 5*2) * 1 = 20 quota points
+	// traffic fee: 0.001 USD * 500000 quota/$ * 1 = 500
+	require.Equal(t, 520, summary.Quota)
+}
+
+func TestCalculateTextQuotaSummaryTrafficFeeScalesWithGroupRatio(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+
+	oldFee := operation_setting.GetTrafficFee()
+	operation_setting.SetTrafficFeeForTest(0.001)
+	t.Cleanup(func() { operation_setting.SetTrafficFeeForTest(oldFee) })
+
+	relayInfo := &relaycommon.RelayInfo{
+		OriginModelName: "gpt-4o",
+		PriceData: hosttypes.PriceData{
+			ModelRatio:      1,
+			CompletionRatio: 1,
+			GroupRatioInfo:  hosttypes.GroupRatioInfo{GroupRatio: 2.5},
+		},
+		StartTime: time.Now(),
+	}
+	usage := &dto.Usage{PromptTokens: 10, CompletionTokens: 0, TotalTokens: 10}
+
+	summary := calculateTextQuotaSummary(ctx, relayInfo, usage)
+
+	// token fee: 10 * 2.5 = 25; traffic fee: 0.001 * 500000 * 2.5 = 1250
+	require.Equal(t, 1275, summary.Quota)
 }
 
 func TestAppendToolSurchargeLogInfoWritesOnlyStructuredFields(t *testing.T) {

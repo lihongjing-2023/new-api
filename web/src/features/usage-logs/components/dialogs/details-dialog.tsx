@@ -232,6 +232,28 @@ function BillingBreakdown(props: {
   const priceOpts = { digitsLarge: 4, digitsSmall: 6, abbreviate: false }
   const fmtPrice = (usd: number) => formatBillingCurrencyFromUSD(usd, priceOpts)
   const baseInputUSD = other.model_ratio != null ? other.model_ratio * 2.0 : 0
+  const userGR = other.user_group_ratio
+  const isUserGR = userGR != null && Number.isFinite(userGR) && userGR !== -1
+  const effectiveGR = isUserGR ? userGR : other.group_ratio
+  const gr =
+    effectiveGR != null && Number.isFinite(effectiveGR) ? effectiveGR : 1
+  const cacheReadTokens = other.cache_tokens || 0
+  const cacheWriteTokens =
+    (other.cache_creation_tokens || 0) +
+    (other.cache_creation_tokens_5m || 0) +
+    (other.cache_creation_tokens_1h || 0)
+  // Under Claude usage semantics the log's prompt_tokens excludes cache
+  // tokens, while OpenAI-compatible usage includes them, so split them out
+  // to avoid double-counting in the input cost.
+  const nonCacheInputTokens = isClaude
+    ? log.prompt_tokens || 0
+    : Math.max((log.prompt_tokens || 0) - cacheReadTokens - cacheWriteTokens, 0)
+  const completionTokens = log.completion_tokens || 0
+  const billingValue = (pricePerM: number, tokens: number): string => {
+    if (tokens <= 0) return `${fmtPrice(pricePerM)}/M`
+    const costUSD = (pricePerM * tokens * gr) / 1_000_000
+    return `${fmtPrice(pricePerM)}/M × ${tokens.toLocaleString()} = ${fmtPrice(costUSD)}`
+  }
 
   if (isTieredExpr) {
     rows.push({
@@ -270,20 +292,20 @@ function BillingBreakdown(props: {
     if (other.model_ratio != null) {
       rows.push({
         label: t('Input'),
-        value: `${fmtPrice(baseInputUSD)}/M`,
+        value: billingValue(baseInputUSD, nonCacheInputTokens),
       })
     }
     if (other.completion_ratio != null && other.model_ratio != null) {
       rows.push({
         label: t('Output'),
-        value: `${fmtPrice(baseInputUSD * other.completion_ratio)}/M`,
+        value: billingValue(
+          baseInputUSD * other.completion_ratio,
+          completionTokens
+        ),
       })
     }
   }
 
-  const userGR = other.user_group_ratio
-  const isUserGR = userGR != null && Number.isFinite(userGR) && userGR !== -1
-  const effectiveGR = isUserGR ? userGR : other.group_ratio
   if (effectiveGR != null && Number.isFinite(effectiveGR)) {
     rows.push({
       label: isUserGR ? t('User Exclusive Ratio') : t('Group Ratio'),
@@ -291,38 +313,47 @@ function BillingBreakdown(props: {
     })
   }
 
-  if (!isTieredExpr && isClaude && hasAnyCacheTokens(other)) {
-    if (other.cache_ratio != null && other.cache_ratio !== 1) {
+  if (!isTieredExpr && hasAnyCacheTokens(other)) {
+    if (cacheReadTokens > 0) {
       rows.push({
         label: t('Cache Read'),
-        value: `${fmtPrice(baseInputUSD * other.cache_ratio)}/M`,
+        value: billingValue(
+          baseInputUSD * (other.cache_ratio ?? 1),
+          cacheReadTokens
+        ),
       })
     }
-    if (
-      other.cache_creation_ratio != null &&
-      other.cache_creation_ratio !== 1
-    ) {
+    const cacheCreation5m = other.cache_creation_tokens_5m || 0
+    const cacheCreation1h = other.cache_creation_tokens_1h || 0
+    const remainingCacheCreation = Math.max(
+      (other.cache_creation_tokens || 0) - cacheCreation5m - cacheCreation1h,
+      0
+    )
+    if (remainingCacheCreation > 0) {
       rows.push({
         label: t('Cache Creation'),
-        value: `${fmtPrice(baseInputUSD * other.cache_creation_ratio)}/M`,
+        value: billingValue(
+          baseInputUSD * (other.cache_creation_ratio ?? 1),
+          remainingCacheCreation
+        ),
       })
     }
-    if (
-      other.cache_creation_ratio_5m != null &&
-      other.cache_creation_ratio_5m !== 0
-    ) {
+    if (cacheCreation5m > 0) {
       rows.push({
         label: t('Cache Creation (5m)'),
-        value: `${fmtPrice(baseInputUSD * other.cache_creation_ratio_5m)}/M`,
+        value: billingValue(
+          baseInputUSD * (other.cache_creation_ratio_5m ?? 1),
+          cacheCreation5m
+        ),
       })
     }
-    if (
-      other.cache_creation_ratio_1h != null &&
-      other.cache_creation_ratio_1h !== 0
-    ) {
+    if (cacheCreation1h > 0) {
       rows.push({
         label: t('Cache Creation (1h)'),
-        value: `${fmtPrice(baseInputUSD * other.cache_creation_ratio_1h)}/M`,
+        value: billingValue(
+          baseInputUSD * (other.cache_creation_ratio_1h ?? 1),
+          cacheCreation1h
+        ),
       })
     }
   }
@@ -378,6 +409,13 @@ function BillingBreakdown(props: {
     rows.push({
       label: t('Audio Input Price'),
       value: fmtPrice(other.audio_input_price),
+    })
+  }
+
+  if (other.traffic_fee && other.traffic_fee > 0) {
+    rows.push({
+      label: t('Traffic Fee'),
+      value: fmtPrice(other.traffic_fee),
     })
   }
 

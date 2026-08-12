@@ -12,6 +12,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/types"
 	"github.com/glebarez/sqlite"
 	"github.com/shopspring/decimal"
@@ -847,4 +848,35 @@ func TestSettle_NonPerCallBilling_AppliesAdaptorAdjustment(t *testing.T) {
 	log := getLastLog(t)
 	require.NotNil(t, log)
 	assert.Equal(t, model.LogTypeRefund, log.Type)
+}
+
+func TestSettle_NonPerCallBilling_AddsTrafficFeeToAdaptorAdjustment(t *testing.T) {
+	truncate(t)
+	ctx := context.Background()
+
+	const userID, tokenID, channelID = 33, 33, 33
+	const initQuota, preConsumed = 10000, 5000
+	const adaptorQuota = 3000
+	const tokenRemain = 8000
+
+	oldFee := operation_setting.GetTrafficFee()
+	operation_setting.SetTrafficFeeForTest(0.001)
+	t.Cleanup(func() { operation_setting.SetTrafficFeeForTest(oldFee) })
+
+	seedUser(t, userID, initQuota)
+	seedToken(t, tokenID, userID, "sk-nonpercall-traffic", tokenRemain)
+	seedChannel(t, channelID)
+
+	task := makeTask(userID, channelID, preConsumed, tokenID, BillingSourceWallet, 0)
+
+	adaptor := &mockAdaptor{adjustReturn: adaptorQuota}
+	taskResult := &relaycommon.TaskInfo{Status: model.TaskStatusSuccess}
+
+	settleTaskBillingOnComplete(ctx, adaptor, task, taskResult)
+
+	// traffic fee: 0.001 * 500000 * 1.0 (BillingContext.GroupRatio) = 500
+	expected := adaptorQuota + 500
+	assert.Equal(t, initQuota+(preConsumed-expected), getUserQuota(t, userID))
+	assert.Equal(t, tokenRemain+(preConsumed-expected), getTokenRemainQuota(t, tokenID))
+	assert.Equal(t, expected, task.Quota)
 }

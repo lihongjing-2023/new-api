@@ -25,6 +25,7 @@ import { PaymentSettingsSection } from '../integrations/payment-settings-section
 import { RatioSettingsCard } from '../models/ratio-settings-card'
 import type { BillingSettings } from '../types'
 import { createSectionRegistry } from '../utils/section-registry'
+import { TrafficFeeSettingsSection } from './traffic-fee-settings'
 
 const getModelDefaults = (settings: BillingSettings) => ({
   ModelPrice: settings.ModelPrice,
@@ -98,6 +99,17 @@ const BILLING_SECTIONS = [
             custom_currency_exchange_rate:
               settings['general_setting.custom_currency_exchange_rate'] ?? 1,
           },
+        }}
+      />
+    ),
+  },
+  {
+    id: 'traffic-fee',
+    titleKey: 'Traffic Fee',
+    build: (settings: BillingSettings) => (
+      <TrafficFeeSettingsSection
+        defaultValues={{
+          trafficFee: settings['traffic_fee_setting.traffic_fee'],
         }}
       />
     ),

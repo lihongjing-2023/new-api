@@ -2,7 +2,7 @@
 #
 # 触发方式：仓库页面点击「云原生构建 / 云端开发」启动开发环境。
 # 初始化流程：
-#   1. 用 ./.ide/Dockerfile 动态构建开发镜像（基于 CNB 默认模板容器
+#   1. 用 .ide/Dockerfile 动态构建开发镜像（基于 CNB 默认模板容器
 #      cnbcool/default-dev-env 扩展，内置 code-server WebIDE / VSCode server，
 #      并补充安装 Go 1.26.1 / Bun / make；构建失败时回退到默认模板镜像）
 #   2. 进入 IDE 前校验工具链版本
@@ -14,13 +14,11 @@ $:
         cpus: 8
       docker:
         # 自定义开发环境镜像；image 作为 build 失败时的回退镜像
-        build: ./.ide/Dockerfile
+        build: .ide/Dockerfile
         image: cnbcool/default-dev-env:latest
       services:
         - vscode
         - docker
-      # 空闲保活时长（分钟），延长开发会话防止环境过早关闭
-      keepAliveTimeout: 240
       stages:
         # 进入开发环境前：快速校验工具链（此阶段失败会销毁环境，便于尽早暴露配置问题）
         - name: 校验开发工具链
