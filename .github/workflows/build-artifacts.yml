@@ -54,12 +54,19 @@ jobs:
   docker:
     name: Build Docker image
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 90
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           fetch-depth: 0
+
+      - name: Free disk space
+        run: |
+          df -h
+          sudo docker system prune -af || true
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          df -h
 
       - name: Resolve version & write VERSION
         run: |
@@ -71,19 +78,22 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
-      - name: Build image
+      - name: Build & export image tar
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           push: false
-          load: true
+          load: false
           tags: new-api:${{ env.VERSION }}
+          outputs: type=docker,dest=new-api-image.tar
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Save image to tar
+      - name: Compress image tar
         run: |
-          docker save new-api:${{ env.VERSION }} | gzip > new-api-image.tar.gz
+          df -h
+          gzip -f new-api-image.tar
+          ls -lh new-api-image.tar.gz
 
       - name: Upload Docker image artifact
         uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1 # v4.6.1
