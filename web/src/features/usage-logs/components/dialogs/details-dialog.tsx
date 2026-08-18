@@ -1233,8 +1233,8 @@ export function DetailsDialog(props: DetailsDialogProps) {
           </DetailSection>
         )}
 
-        {/* Param override */}
-        {other?.po && Array.isArray(other.po) && other.po.length > 0 && (
+        {/* Param override (admin only) */}
+        {props.isAdmin && other?.po && Array.isArray(other.po) && other.po.length > 0 && (
           <DetailSection
             icon={<Settings2 className='size-3.5' aria-hidden='true' />}
             iconTone='chart-3'
