@@ -159,13 +159,45 @@ func chooseDB(envName string, isLog bool) (*gorm.DB, common.DatabaseType, error)
 				dsn += "?parseTime=true"
 			}
 		}
-		db, err := gorm.Open(mysql.Open(dsn), newGormConfig(true))
+		db, err := gorm.Open(mysql.Open(ensureMySQLDSNTimeoutParams(dsn)), newGormConfig(true))
 		return db, common.DatabaseTypeMySQL, err
 	}
 	// Use SQLite
 	common.SysLog("SQL_DSN not set, using SQLite as database")
 	db, err := gorm.Open(sqlite.Open(common.SQLitePath), newGormConfig(true))
 	return db, common.DatabaseTypeSQLite, err
+}
+
+// ensureMySQLDSNTimeoutParams appends dial/read/write timeouts to a MySQL DSN
+// unless the caller already set them. Without these, a stalled or
+// high-latency connection blocks every query indefinitely, which shows up as
+// an apparently frozen startup during migration. Each value is a Go duration
+// and can be overridden via SQL_DIAL_TIMEOUT / SQL_READ_TIMEOUT /
+// SQL_WRITE_TIMEOUT.
+func ensureMySQLDSNTimeoutParams(dsn string) string {
+	params := []struct {
+		envName    string
+		paramName  string
+		defaultVal string
+	}{
+		{"SQL_DIAL_TIMEOUT", "timeout", "10s"},
+		{"SQL_READ_TIMEOUT", "readTimeout", "120s"},
+		{"SQL_WRITE_TIMEOUT", "writeTimeout", "120s"},
+	}
+	first := !strings.Contains(dsn, "?")
+	for _, p := range params {
+		if strings.Contains(dsn, p.paramName+"=") {
+			continue
+		}
+		if first {
+			dsn += "?"
+			first = false
+		} else {
+			dsn += "&"
+		}
+		dsn += p.paramName + "=" + common.GetEnvOrDefaultString(p.envName, p.defaultVal)
+	}
+	return dsn
 }
 
 func InitDB() (err error) {
@@ -200,8 +232,7 @@ func InitDB() (err error) {
 		if common.UsingMainDatabase(common.DatabaseTypeMySQL) {
 			//_, _ = sqlDB.Exec("ALTER TABLE channels MODIFY model_mapping TEXT;") // TODO: delete this line when most users have upgraded
 		}
-		common.SysLog("database migration started")
-		err = migrateDB()
+		err = runStartupMigration()
 		return err
 	} else {
 		common.FatalLog(err)
@@ -250,15 +281,51 @@ func InitLogDB() (err error) {
 	return err
 }
 
-func migrateDB() error {
-	// Migrate price_amount column from float/double to decimal for existing tables
-	migrateSubscriptionPlanPriceAmount()
-	// Migrate model_limits column from varchar to text for existing tables
-	if err := migrateTokenModelLimitsToText(); err != nil {
-		return err
+// runStartupMigration applies schema changes on startup. It honours two
+// opt-in env vars:
+//   - SKIP_DB_MIGRATION=true: skip the per-table AutoMigrate entirely (useful
+//     for restarts on an already-migrated schema). Table existence is still
+//     verified with a single catalog query so a missing table fails loudly
+//     instead of failing later at first use.
+//   - DB_MIGRATION_CONCURRENT=true: migrate every table in parallel. This
+//     helps high-latency database links where the per-table catalog round
+//     trips would otherwise serialize into minutes of startup time.
+func runStartupMigration() error {
+	if common.GetEnvOrDefaultBool("SKIP_DB_MIGRATION", false) {
+		missing, err := missingMigrationTables()
+		if err != nil {
+			return fmt.Errorf("failed to verify database tables before skipping migration: %w", err)
+		}
+		if len(missing) > 0 {
+			return fmt.Errorf("SKIP_DB_MIGRATION is enabled but the following tables are missing: %v; disable the flag so startup migration can create them", missing)
+		}
+		common.SysLog("database migration skipped (SKIP_DB_MIGRATION=true)")
+		return nil
 	}
+	if common.GetEnvOrDefaultBool("DB_MIGRATION_CONCURRENT", false) {
+		common.SysLog("database migration started (concurrent mode)")
+		return migrateDBFast()
+	}
+	common.SysLog("database migration started")
+	return migrateDB()
+}
 
-	err := DB.AutoMigrate(
+type migrationItem struct {
+	model interface{}
+	name  string
+}
+
+func tableNameOf(model interface{}) string {
+	stmt := &gorm.Statement{DB: DB}
+	_ = stmt.Parse(model)
+	return stmt.Table
+}
+
+// migrationModels lists every table managed by the startup migration. All
+// tables are independent (no foreign keys between them), so migration order
+// is irrelevant and parallel migration is safe.
+func migrationModels() []migrationItem {
+	models := []interface{}{
 		&Channel{},
 		&Token{},
 		&User{},
@@ -292,9 +359,46 @@ func migrateDB() error {
 		&SystemTaskLock{},
 		&CasbinRule{},
 		&AuthzRole{},
-	)
+	}
+	items := make([]migrationItem, 0, len(models))
+	for _, m := range models {
+		items = append(items, migrationItem{model: m, name: tableNameOf(m)})
+	}
+	return items
+}
+
+func missingMigrationTables() ([]string, error) {
+	existing, err := DB.Migrator().GetTables()
 	if err != nil {
+		return nil, err
+	}
+	tableSet := make(map[string]struct{}, len(existing))
+	for _, t := range existing {
+		tableSet[strings.ToLower(t)] = struct{}{}
+	}
+	var missing []string
+	for _, item := range migrationModels() {
+		if _, ok := tableSet[strings.ToLower(item.name)]; !ok {
+			missing = append(missing, item.name)
+		}
+	}
+	return missing, nil
+}
+
+func migrateDB() error {
+	// Migrate price_amount column from float/double to decimal for existing tables
+	migrateSubscriptionPlanPriceAmount()
+	// Migrate model_limits column from varchar to text for existing tables
+	if err := migrateTokenModelLimitsToText(); err != nil {
 		return err
+	}
+
+	for _, item := range migrationModels() {
+		tableStart := time.Now()
+		if err := DB.AutoMigrate(item.model); err != nil {
+			return fmt.Errorf("failed to migrate table %s: %w", item.name, err)
+		}
+		common.SysLog(fmt.Sprintf("table %s migrated in %s", item.name, time.Since(tableStart).Round(time.Millisecond)))
 	}
 	if err := InitializeUserAuthVersions(); err != nil {
 		return err
@@ -311,60 +415,28 @@ func migrateDB() error {
 			return err
 		}
 	}
+	common.SysLog("database migrated")
 	return nil
 }
 
 func migrateDBFast() error {
+	items := migrationModels()
+
+	// 动态计算migration数量，确保errChan缓冲区足够大
+	errChan := make(chan error, len(items))
 
 	var wg sync.WaitGroup
-
-	migrations := []struct {
-		model interface{}
-		name  string
-	}{
-		{&Channel{}, "Channel"},
-		{&Token{}, "Token"},
-		{&User{}, "User"},
-		{&UserSession{}, "UserSession"},
-		{&AuthFlow{}, "AuthFlow"},
-		{&ExternalIdentityClaim{}, "ExternalIdentityClaim"},
-		{&PasskeyCredential{}, "PasskeyCredential"},
-		{&Option{}, "Option"},
-		{&Redemption{}, "Redemption"},
-		{&Ability{}, "Ability"},
-		{&Log{}, "Log"},
-		{&Midjourney{}, "Midjourney"},
-		{&TopUp{}, "TopUp"},
-		{&QuotaData{}, "QuotaData"},
-		{&Task{}, "Task"},
-		{&Model{}, "Model"},
-		{&Vendor{}, "Vendor"},
-		{&PrefillGroup{}, "PrefillGroup"},
-		{&Setup{}, "Setup"},
-		{&TwoFA{}, "TwoFA"},
-		{&TwoFABackupCode{}, "TwoFABackupCode"},
-		{&Checkin{}, "Checkin"},
-		{&SubscriptionOrder{}, "SubscriptionOrder"},
-		{&UserSubscription{}, "UserSubscription"},
-		{&SubscriptionPreConsumeRecord{}, "SubscriptionPreConsumeRecord"},
-		{&CustomOAuthProvider{}, "CustomOAuthProvider"},
-		{&UserOAuthBinding{}, "UserOAuthBinding"},
-		{&PerfMetric{}, "PerfMetric"},
-		{&SystemInstance{}, "SystemInstance"},
-		{&SystemTask{}, "SystemTask"},
-		{&SystemTaskLock{}, "SystemTaskLock"},
-	}
-	// 动态计算migration数量，确保errChan缓冲区足够大
-	errChan := make(chan error, len(migrations))
-
-	for _, m := range migrations {
+	for _, item := range items {
 		wg.Add(1)
-		go func(model interface{}, name string) {
+		go func(item migrationItem) {
 			defer wg.Done()
-			if err := DB.AutoMigrate(model); err != nil {
-				errChan <- fmt.Errorf("failed to migrate %s: %v", name, err)
+			tableStart := time.Now()
+			if err := DB.AutoMigrate(item.model); err != nil {
+				errChan <- fmt.Errorf("failed to migrate table %s: %v", item.name, err)
+				return
 			}
-		}(m.model, m.name)
+			common.SysLog(fmt.Sprintf("table %s migrated in %s", item.name, time.Since(tableStart).Round(time.Millisecond)))
+		}(item)
 	}
 
 	// Wait for all migrations to complete
