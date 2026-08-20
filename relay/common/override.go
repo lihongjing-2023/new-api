@@ -1709,6 +1709,7 @@ func modifyValue(data []byte, path string, value interface{}, keepOrigin, isPrep
 	case current.Type == gjson.JSON:
 		return mergeObjects(data, path, value, keepOrigin)
 	}
+	logParamOverrideOpError("modify", path, current, data)
 	return data, fmt.Errorf("operation not supported for type: %v", current.Type)
 }
 
@@ -1808,9 +1809,14 @@ func transformStringValue(data []byte, path string, transform func(string) strin
 	return sjson.SetBytes(data, path, transform(current.String()))
 }
 
+func logParamOverrideOpError(op, path string, current gjson.Result, data []byte) {
+	common.SysError(fmt.Sprintf("ParamOverride %s failed: path=%q type=%s value=%s body=%s", op, path, current.Type.String(), current.Raw, string(data)))
+}
+
 func replaceStringValue(data []byte, path, from, to string) ([]byte, error) {
 	current := gjson.GetBytes(data, path)
 	if current.Type != gjson.String {
+		logParamOverrideOpError("replace", path, current, data)
 		return data, fmt.Errorf("operation not supported for type: %v", current.Type)
 	}
 	if from == "" {
@@ -1822,6 +1828,7 @@ func replaceStringValue(data []byte, path, from, to string) ([]byte, error) {
 func regexReplaceStringValue(data []byte, path, pattern, replacement string) ([]byte, error) {
 	current := gjson.GetBytes(data, path)
 	if current.Type != gjson.String {
+		logParamOverrideOpError("regex_replace", path, current, data)
 		return data, fmt.Errorf("operation not supported for type: %v", current.Type)
 	}
 	if pattern == "" {
