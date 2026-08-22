@@ -252,7 +252,10 @@ function BillingBreakdown(props: {
   const billingValue = (pricePerM: number, tokens: number): string => {
     if (tokens <= 0) return `${fmtPrice(pricePerM)}/M`
     const costUSD = (pricePerM * tokens * gr) / 1_000_000
-    return `${fmtPrice(pricePerM)}/M × ${tokens.toLocaleString()} = ${fmtPrice(costUSD)}`
+    // Show the group ratio explicitly in the formula when it is not 1, so the
+    // displayed expression is self-consistent with the computed cost.
+    const grFactor = gr !== 1 ? ` × ${formatRatio(gr)}` : ''
+    return `${fmtPrice(pricePerM)}/M × ${tokens.toLocaleString()}${grFactor} = ${fmtPrice(costUSD)}`
   }
 
   if (isTieredExpr) {
