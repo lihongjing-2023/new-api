@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net/http"
 	"regexp"
-	"sort"
 	"strconv"
 	"strings"
 
@@ -47,8 +46,15 @@ var paramOverrideSensitivePathPrefixes = []string{
 	"system_instruction",
 }
 
+// paramOverrideAuditMaxLines 限制写入消费日志的审计行数。
+// 通配符操作（如 messages.*.role）在长对话上会展开出上千行，
+// 不截断会让 logs.other 膨胀到上百 KB，日志表每天多出上百 MB。
+const paramOverrideAuditMaxLines = 64
+
 type paramOverrideAuditRecorder struct {
-	lines []string
+	lines     []string
+	seen      map[string]struct{}
+	truncated int
 }
 
 type ConditionOperation struct {
@@ -200,6 +206,10 @@ func ApplyParamOverrideWithRelayInfo(jsonData []byte, info *RelayInfo) ([]byte, 
 	syncRuntimeHeaderOverrideFromContext(info, overrideCtx)
 	if info != nil {
 		if recorder != nil {
+			if recorder.truncated > 0 {
+				recorder.lines = append(recorder.lines,
+					fmt.Sprintf("... and %d more operations", recorder.truncated))
+			}
 			info.ParamOverrideAudit = recorder.lines
 		} else {
 			info.ParamOverrideAudit = nil
@@ -299,9 +309,17 @@ func (r *paramOverrideAuditRecorder) recordOperation(mode, path, from, to string
 	if line == "" {
 		return
 	}
-	if lo.Contains(r.lines, line) {
+	if r.seen == nil {
+		r.seen = make(map[string]struct{}, 16)
+	}
+	if _, duplicated := r.seen[line]; duplicated {
 		return
 	}
+	if len(r.lines) >= paramOverrideAuditMaxLines {
+		r.truncated++
+		return
+	}
+	r.seen[line] = struct{}{}
 	r.lines = append(r.lines, line)
 }
 
@@ -806,23 +824,23 @@ func applyOperations(jsonData []byte, operations []ParamOperation, conditionCont
 
 		switch op.Mode {
 		case "delete":
-			for _, path := range opPaths {
-				result, err = deleteValue(result, path)
-				if err != nil {
-					break
+			result, err = applyToPathsBatched(result, opPaths, deleteValue)
+			if err == nil {
+				for _, path := range opPaths {
+					auditRecorder.recordOperation("delete", path, "", "", nil)
 				}
-				auditRecorder.recordOperation("delete", path, "", "", nil)
 			}
 		case "set":
-			for _, path := range opPaths {
-				if op.KeepOrigin && gjson.GetBytes(result, path).Exists() {
-					continue
+			result, err = applyToPathsBatched(result, opPaths, func(d []byte, p string) ([]byte, error) {
+				if op.KeepOrigin && gjson.GetBytes(d, p).Exists() {
+					return d, nil
 				}
-				result, err = sjson.SetBytes(result, path, op.Value)
-				if err != nil {
-					break
+				return sjson.SetBytes(d, p, op.Value)
+			})
+			if err == nil {
+				for _, path := range opPaths {
+					auditRecorder.recordOperation("set", path, "", "", op.Value)
 				}
-				auditRecorder.recordOperation("set", path, "", "", op.Value)
 			}
 		case "move":
 			opFrom := processNegativeIndex(result, op.From)
@@ -842,92 +860,111 @@ func applyOperations(jsonData []byte, operations []ParamOperation, conditionCont
 				auditRecorder.recordOperation("copy", "", opFrom, opTo, nil)
 			}
 		case "prepend":
-			for _, path := range opPaths {
-				result, err = modifyValue(result, path, op.Value, op.KeepOrigin, true)
-				if err != nil {
-					break
+			result, err = applyToPathsBatched(result, opPaths, func(d []byte, p string) ([]byte, error) {
+				return modifyValue(d, p, op.Value, op.KeepOrigin, true)
+			})
+			if err == nil {
+				for _, path := range opPaths {
+					auditRecorder.recordOperation("prepend", path, "", "", op.Value)
 				}
-				auditRecorder.recordOperation("prepend", path, "", "", op.Value)
 			}
 		case "append":
-			for _, path := range opPaths {
-				result, err = modifyValue(result, path, op.Value, op.KeepOrigin, false)
-				if err != nil {
-					break
+			result, err = applyToPathsBatched(result, opPaths, func(d []byte, p string) ([]byte, error) {
+				return modifyValue(d, p, op.Value, op.KeepOrigin, false)
+			})
+			if err == nil {
+				for _, path := range opPaths {
+					auditRecorder.recordOperation("append", path, "", "", op.Value)
 				}
-				auditRecorder.recordOperation("append", path, "", "", op.Value)
 			}
 		case "trim_prefix":
-			for _, path := range opPaths {
-				result, err = trimStringValue(result, path, op.Value, true)
-				if err != nil {
-					break
+			result, err = applyToPathsBatched(result, opPaths, func(d []byte, p string) ([]byte, error) {
+				return trimStringValue(d, p, op.Value, true)
+			})
+			if err == nil {
+				for _, path := range opPaths {
+					auditRecorder.recordOperation("trim_prefix", path, "", "", op.Value)
 				}
-				auditRecorder.recordOperation("trim_prefix", path, "", "", op.Value)
 			}
 		case "trim_suffix":
-			for _, path := range opPaths {
-				result, err = trimStringValue(result, path, op.Value, false)
-				if err != nil {
-					break
+			result, err = applyToPathsBatched(result, opPaths, func(d []byte, p string) ([]byte, error) {
+				return trimStringValue(d, p, op.Value, false)
+			})
+			if err == nil {
+				for _, path := range opPaths {
+					auditRecorder.recordOperation("trim_suffix", path, "", "", op.Value)
 				}
-				auditRecorder.recordOperation("trim_suffix", path, "", "", op.Value)
 			}
 		case "ensure_prefix":
-			for _, path := range opPaths {
-				result, err = ensureStringAffix(result, path, op.Value, true)
-				if err != nil {
-					break
+			result, err = applyToPathsBatched(result, opPaths, func(d []byte, p string) ([]byte, error) {
+				return ensureStringAffix(d, p, op.Value, true)
+			})
+			if err == nil {
+				for _, path := range opPaths {
+					auditRecorder.recordOperation("ensure_prefix", path, "", "", op.Value)
 				}
-				auditRecorder.recordOperation("ensure_prefix", path, "", "", op.Value)
 			}
 		case "ensure_suffix":
-			for _, path := range opPaths {
-				result, err = ensureStringAffix(result, path, op.Value, false)
-				if err != nil {
-					break
+			result, err = applyToPathsBatched(result, opPaths, func(d []byte, p string) ([]byte, error) {
+				return ensureStringAffix(d, p, op.Value, false)
+			})
+			if err == nil {
+				for _, path := range opPaths {
+					auditRecorder.recordOperation("ensure_suffix", path, "", "", op.Value)
 				}
-				auditRecorder.recordOperation("ensure_suffix", path, "", "", op.Value)
 			}
 		case "trim_space":
-			for _, path := range opPaths {
-				result, err = transformStringValue(result, path, strings.TrimSpace)
-				if err != nil {
-					break
+			result, err = applyToPathsBatched(result, opPaths, func(d []byte, p string) ([]byte, error) {
+				return transformStringValue(d, p, strings.TrimSpace)
+			})
+			if err == nil {
+				for _, path := range opPaths {
+					auditRecorder.recordOperation("trim_space", path, "", "", nil)
 				}
-				auditRecorder.recordOperation("trim_space", path, "", "", nil)
 			}
 		case "to_lower":
-			for _, path := range opPaths {
-				result, err = transformStringValue(result, path, strings.ToLower)
-				if err != nil {
-					break
+			result, err = applyToPathsBatched(result, opPaths, func(d []byte, p string) ([]byte, error) {
+				return transformStringValue(d, p, strings.ToLower)
+			})
+			if err == nil {
+				for _, path := range opPaths {
+					auditRecorder.recordOperation("to_lower", path, "", "", nil)
 				}
-				auditRecorder.recordOperation("to_lower", path, "", "", nil)
 			}
 		case "to_upper":
-			for _, path := range opPaths {
-				result, err = transformStringValue(result, path, strings.ToUpper)
-				if err != nil {
-					break
+			result, err = applyToPathsBatched(result, opPaths, func(d []byte, p string) ([]byte, error) {
+				return transformStringValue(d, p, strings.ToUpper)
+			})
+			if err == nil {
+				for _, path := range opPaths {
+					auditRecorder.recordOperation("to_upper", path, "", "", nil)
 				}
-				auditRecorder.recordOperation("to_upper", path, "", "", nil)
 			}
 		case "replace":
-			for _, path := range opPaths {
-				result, err = replaceStringValue(result, path, op.From, op.To)
-				if err != nil {
-					break
+			result, err = applyToPathsBatched(result, opPaths, func(d []byte, p string) ([]byte, error) {
+				return replaceStringValue(d, p, op.From, op.To)
+			})
+			if err == nil {
+				for _, path := range opPaths {
+					auditRecorder.recordOperation("replace", path, op.From, op.To, nil)
 				}
-				auditRecorder.recordOperation("replace", path, op.From, op.To, nil)
 			}
 		case "regex_replace":
-			for _, path := range opPaths {
-				result, err = regexReplaceStringValue(result, path, op.From, op.To)
-				if err != nil {
-					break
+			var compiledPattern *regexp.Regexp
+			if strings.TrimSpace(op.From) == "" {
+				err = fmt.Errorf("regex pattern is required")
+			} else {
+				compiledPattern, err = regexp.Compile(op.From)
+			}
+			if err == nil {
+				result, err = applyToPathsBatched(result, opPaths, func(d []byte, p string) ([]byte, error) {
+					return regexReplaceStringValue(d, p, compiledPattern, op.To)
+				})
+			}
+			if err == nil {
+				for _, path := range opPaths {
+					auditRecorder.recordOperation("regex_replace", path, op.From, op.To, nil)
 				}
-				auditRecorder.recordOperation("regex_replace", path, op.From, op.To, nil)
 			}
 		case "return_error":
 			auditRecorder.recordOperation("return_error", op.Path, "", "", op.Value)
@@ -1629,18 +1666,22 @@ func resolveOperationPaths(data []byte, path string) ([]string, error) {
 	return expandWildcardPaths(data, path)
 }
 
+// expandWildcardPaths 展开路径中的 * 通配符。
+//
+// 旧实现先把整个请求体 Unmarshal 成 map[string]interface{} 树再遍历，
+// 对包含长 messages 或大 base64 字段的 body 会产生巨量临时对象。
+// 这里改成基于 gjson 的懒解析遍历：只定位通配符命中的节点，
+// 不为未命中的子树分配任何对象。
+//
+// 语义与旧实现一致：对象末段不校验存在性、数组下标越界丢弃。
 func expandWildcardPaths(data []byte, path string) ([]string, error) {
-	var root interface{}
-	if err := common.Unmarshal(data, &root); err != nil {
-		return nil, err
-	}
-
 	segments := strings.Split(path, ".")
+	root := gjson.ParseBytes(data)
 	paths := collectWildcardPaths(root, segments, nil)
 	return lo.Uniq(paths), nil
 }
 
-func collectWildcardPaths(node interface{}, segments []string, prefix []string) []string {
+func collectWildcardPaths(node gjson.Result, segments []string, prefix []string) []string {
 	if len(segments) == 0 {
 		return []string{strings.Join(prefix, ".")}
 	}
@@ -1652,44 +1693,196 @@ func collectWildcardPaths(node interface{}, segments []string, prefix []string) 
 	isLast := len(segments) == 1
 
 	if segment == "*" {
-		switch typed := node.(type) {
-		case map[string]interface{}:
-			keys := lo.Keys(typed)
-			sort.Strings(keys)
-			return lo.FlatMap(keys, func(key string, _ int) []string {
-				return collectWildcardPaths(typed[key], segments[1:], append(prefix, key))
+		var paths []string
+		switch {
+		case node.IsArray():
+			index := 0
+			node.ForEach(func(_, value gjson.Result) bool {
+				paths = append(paths, collectWildcardPaths(value, segments[1:], append(prefix, strconv.Itoa(index)))...)
+				index++
+				return true
 			})
-		case []interface{}:
-			return lo.FlatMap(lo.Range(len(typed)), func(index int, _ int) []string {
-				return collectWildcardPaths(typed[index], segments[1:], append(prefix, strconv.Itoa(index)))
+		case node.IsObject():
+			node.ForEach(func(key, value gjson.Result) bool {
+				paths = append(paths, collectWildcardPaths(value, segments[1:], append(prefix, key.String()))...)
+				return true
 			})
-		default:
-			return nil
 		}
+		return paths
 	}
 
-	switch typed := node.(type) {
-	case map[string]interface{}:
+	switch {
+	case node.IsObject():
 		if isLast {
 			return []string{strings.Join(append(prefix, segment), ".")}
 		}
-		next, exists := typed[segment]
-		if !exists {
+		next := node.Get(segment)
+		if !next.Exists() {
 			return nil
 		}
 		return collectWildcardPaths(next, segments[1:], append(prefix, segment))
-	case []interface{}:
+	case node.IsArray():
+		array := node.Array()
 		index, err := strconv.Atoi(segment)
-		if err != nil || index < 0 || index >= len(typed) {
+		if err != nil || index < 0 || index >= len(array) {
 			return nil
 		}
 		if isLast {
 			return []string{strings.Join(append(prefix, segment), ".")}
 		}
-		return collectWildcardPaths(typed[index], segments[1:], append(prefix, segment))
+		return collectWildcardPaths(array[index], segments[1:], append(prefix, segment))
 	default:
 		return nil
 	}
+}
+
+// pathBatchThreshold 控制何时启用子树批处理。
+// 路径数很少时逐条 sjson 调用开销已经很小，批处理反而多一层子树读写。
+const pathBatchThreshold = 4
+
+// applyToPathsBatched 对一组已展开的路径应用同一个操作 fn。
+//
+// 朴素实现是每条路径都在完整请求体上各调一次 gjson/sjson，每条路径
+// 都会产生一份整包拷贝。像 messages.*.role 这种在长对话上会展开出
+// 上千条路径的操作，总开销是 O(路径数 × body 大小)，大 body 下直接
+// 打满 CPU。这里按公共前缀分组：在共享子树的 raw bytes 上递归应用，
+// 最后一次性写回，总开销约为 O(body)。
+//
+// 单次通配符展开出的路径作用在互不相交的子树上，因此与逐条应用
+// 的结果一致（与既有 DeleteWildcardEqualsIndexedPaths 测试锁定的
+// 语义相同）。
+func applyToPathsBatched(data []byte, paths []string, fn func([]byte, string) ([]byte, error)) ([]byte, error) {
+	if len(paths) < pathBatchThreshold {
+		var err error
+		for _, path := range paths {
+			data, err = fn(data, path)
+			if err != nil {
+				return nil, err
+			}
+		}
+		return data, nil
+	}
+
+	segPaths := make([][]string, 0, len(paths))
+	for _, path := range paths {
+		segPaths = append(segPaths, strings.Split(path, "."))
+	}
+	return applyToSegmentGroups(data, segPaths, fn)
+}
+
+type wildcardSegmentGroup struct {
+	key   string
+	child [][]string
+}
+
+func applyToSegmentGroups(data []byte, segPaths [][]string, fn func([]byte, string) ([]byte, error)) ([]byte, error) {
+	groups := make([]wildcardSegmentGroup, 0, len(segPaths))
+	groupIndex := make(map[string]int, len(segPaths))
+	var leaves []string
+
+	for _, segPath := range segPaths {
+		if len(segPath) == 0 {
+			continue
+		}
+		if len(segPath) == 1 {
+			leaves = append(leaves, segPath[0])
+			continue
+		}
+		key := segPath[0]
+		idx, exists := groupIndex[key]
+		if !exists {
+			idx = len(groups)
+			groupIndex[key] = idx
+			groups = append(groups, wildcardSegmentGroup{key: key})
+		}
+		groups[idx].child = append(groups[idx].child, segPath[1:])
+	}
+
+	var err error
+	for _, leaf := range leaves {
+		data, err = fn(data, leaf)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if len(groups) == 0 {
+		return data, nil
+	}
+
+	// 数组快速路径：子分组全部是基于数组下标时单次遍历完成，
+	// 避免对 messages 这种长数组按下标逐个 gjson 定位的 O(n²) 扫描。
+	if array := gjson.ParseBytes(data); array.IsArray() {
+		if next, handled, arrayErr := applyToArrayElementGroups(array, groups, fn); handled || arrayErr != nil {
+			return next, arrayErr
+		}
+	}
+
+	for _, group := range groups {
+		child := gjson.GetBytes(data, group.key)
+		if !child.Exists() {
+			// 父级不存在时回退到整包逐条应用，保留 sjson 自动创建路径的语义。
+			for _, childSegs := range group.child {
+				fullPath := group.key + "." + strings.Join(childSegs, ".")
+				data, err = fn(data, fullPath)
+				if err != nil {
+					return nil, err
+				}
+			}
+			continue
+		}
+		next, applyErr := applyToSegmentGroups([]byte(child.Raw), group.child, fn)
+		if applyErr != nil {
+			return nil, applyErr
+		}
+		data, err = sjson.SetRawBytes(data, group.key, next)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return data, nil
+}
+
+// applyToArrayElementGroups 在数组节点上一次性应用所有下标分组。
+// handled=false 表示存在非数字或越界下标，调用方需走通用回退路径。
+func applyToArrayElementGroups(array gjson.Result, groups []wildcardSegmentGroup, fn func([]byte, string) ([]byte, error)) (result []byte, handled bool, err error) {
+	elements := array.Array()
+	type elementWork struct {
+		index int
+		child [][]string
+	}
+	work := make([]elementWork, 0, len(groups))
+	for _, group := range groups {
+		index, convErr := strconv.Atoi(group.key)
+		if convErr != nil || index < 0 || index >= len(elements) {
+			return nil, false, nil
+		}
+		work = append(work, elementWork{index: index, child: group.child})
+	}
+
+	replacements := make(map[int][]byte, len(work))
+	for _, item := range work {
+		next, applyErr := applyToSegmentGroups([]byte(elements[item.index].Raw), item.child, fn)
+		if applyErr != nil {
+			return nil, true, applyErr
+		}
+		replacements[item.index] = next
+	}
+
+	var builder strings.Builder
+	builder.Grow(len(array.Raw) + 16)
+	builder.WriteByte('[')
+	for i, element := range elements {
+		if i > 0 {
+			builder.WriteByte(',')
+		}
+		if next, ok := replacements[i]; ok {
+			builder.Write(next)
+		} else {
+			builder.WriteString(element.Raw)
+		}
+	}
+	builder.WriteByte(']')
+	return []byte(builder.String()), true, nil
 }
 
 func deleteValue(data []byte, path string) ([]byte, error) {
@@ -1825,20 +2018,13 @@ func replaceStringValue(data []byte, path, from, to string) ([]byte, error) {
 	return sjson.SetBytes(data, path, strings.ReplaceAll(current.String(), from, to))
 }
 
-func regexReplaceStringValue(data []byte, path, pattern, replacement string) ([]byte, error) {
+func regexReplaceStringValue(data []byte, path string, pattern *regexp.Regexp, replacement string) ([]byte, error) {
 	current := gjson.GetBytes(data, path)
 	if current.Type != gjson.String {
 		logParamOverrideOpError("regex_replace", path, current, data)
 		return data, fmt.Errorf("operation not supported for type: %v", current.Type)
 	}
-	if pattern == "" {
-		return data, fmt.Errorf("regex pattern is required")
-	}
-	re, err := regexp.Compile(pattern)
-	if err != nil {
-		return data, err
-	}
-	return sjson.SetBytes(data, path, re.ReplaceAllString(current.String(), replacement))
+	return sjson.SetBytes(data, path, pattern.ReplaceAllString(current.String(), replacement))
 }
 
 type pruneObjectsOptions struct {

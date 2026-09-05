@@ -123,6 +123,8 @@ func formatUserLogs(logs []*Log, startIdx int) {
 			delete(otherMap, "admin_info")
 			// Remove operation-audit details (operator/route info), admin-only.
 			delete(otherMap, "audit_info")
+			// Remove param-override audit lines (channel config details), admin-only.
+			delete(otherMap, "po")
 			// delete(otherMap, "reject_reason")
 			// delete(otherMap, "stream_status")
 		}

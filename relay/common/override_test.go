@@ -377,6 +377,150 @@ func TestApplyParamOverrideDeleteWildcardEqualsIndexedPaths(t *testing.T) {
 	assertJSONEqual(t, string(indexedOut), string(wildcardOut))
 }
 
+// 批处理路径（路径数 >= pathBatchThreshold）下，通配符 replace 必须与
+// 逐条索引 replace 的结果一致。该用例锁定的是真实的高频场景：
+// messages.*.role 在长对话上会展开出大量路径，实现按公共子树批量写回，
+// 语义不得与逐条应用产生偏差。
+func TestApplyParamOverrideReplaceWildcardEqualsIndexedPaths(t *testing.T) {
+	roles := []string{"system", "user", "developer", "assistant", "system", "user", "developer", "assistant"}
+	messages := lo.Map(roles, func(role string, index int) interface{} {
+		return map[string]interface{}{
+			"role":    role,
+			"content": fmt.Sprintf("message-%d", index),
+		}
+	})
+	input, err := common2.Marshal(map[string]interface{}{
+		"model":    "gpt-4",
+		"messages": messages,
+	})
+	require.NoError(t, err)
+
+	wildcardOverride := map[string]interface{}{
+		"operations": []interface{}{
+			map[string]interface{}{
+				"path": "messages.*.role",
+				"mode": "replace",
+				"from": "system",
+				"to":   "user",
+			},
+			map[string]interface{}{
+				"path": "messages.*.role",
+				"mode": "replace",
+				"from": "developer",
+				"to":   "user",
+			},
+		},
+	}
+
+	indexedOps := make([]interface{}, 0, len(roles)*2)
+	for _, pair := range [][2]string{{"system", "user"}, {"developer", "user"}} {
+		for index := range roles {
+			indexedOps = append(indexedOps, map[string]interface{}{
+				"path": fmt.Sprintf("messages.%d.role", index),
+				"mode": "replace",
+				"from": pair[0],
+				"to":   pair[1],
+			})
+		}
+	}
+	indexedOverride := map[string]interface{}{"operations": indexedOps}
+
+	wildcardOut, err := ApplyParamOverride(input, wildcardOverride, nil)
+	require.NoError(t, err)
+	indexedOut, err := ApplyParamOverride(input, indexedOverride, nil)
+	require.NoError(t, err)
+
+	assertJSONEqual(t, string(indexedOut), string(wildcardOut))
+
+	var got struct {
+		Messages []struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		} `json:"messages"`
+	}
+	require.NoError(t, common2.Unmarshal(wildcardOut, &got))
+	require.Len(t, got.Messages, len(roles))
+	expectedRoles := []string{"user", "user", "user", "assistant", "user", "user", "user", "assistant"}
+	for index, message := range got.Messages {
+		assert.Equal(t, expectedRoles[index], message.Role, "message %d role", index)
+		assert.Equal(t, fmt.Sprintf("message-%d", index), message.Content, "message %d content", index)
+	}
+}
+
+// 嵌套数组上的多层通配符在批处理路径下也必须保持语义：
+// 数组元素按单次遍历写回，未命中的元素内容保持不变。
+func TestApplyParamOverrideReplaceWildcardNestedArrayBatched(t *testing.T) {
+	makeItems := func(names ...string) []interface{} {
+		return lo.Map(names, func(name string, _ int) interface{} {
+			return map[string]interface{}{"name": name}
+		})
+	}
+	input, err := common2.Marshal(map[string]interface{}{
+		"groups": []interface{}{
+			map[string]interface{}{"items": makeItems("a", "b", "c")},
+			map[string]interface{}{"items": makeItems("d", "e")},
+			map[string]interface{}{"items": makeItems("f", "g", "h")},
+			map[string]interface{}{"items": makeItems("i")},
+		},
+	})
+	require.NoError(t, err)
+
+	override := map[string]interface{}{
+		"operations": []interface{}{
+			map[string]interface{}{
+				"path": "groups.*.items.*.name",
+				"mode": "replace",
+				"from": "a",
+				"to":   "z",
+			},
+		},
+	}
+
+	out, err := ApplyParamOverride(input, override, nil)
+	require.NoError(t, err)
+
+	var got struct {
+		Groups []struct {
+			Items []struct {
+				Name string `json:"name"`
+			} `json:"items"`
+		} `json:"groups"`
+	}
+	require.NoError(t, common2.Unmarshal(out, &got))
+	names := lo.FlatMap(got.Groups, func(group struct {
+		Items []struct {
+			Name string `json:"name"`
+		} `json:"items"`
+	}, _ int) []string {
+		return lo.Map(group.Items, func(item struct {
+			Name string `json:"name"`
+		}, _ int) string {
+			return item.Name
+		})
+	})
+	assert.Equal(t, []string{"z", "b", "c", "d", "e", "f", "g", "h", "i"}, names)
+}
+
+// 通配符操作在长对话上会展开出上千条审计行，写入日志前必须截断，
+// 否则 logs.other 会膨胀到上百 KB（真实事故：日志表每天多出上百 MB）。
+func TestParamOverrideAuditRecorderCapsLines(t *testing.T) {
+	recorder := &paramOverrideAuditRecorder{}
+	overflow := 10
+	for i := 0; i < paramOverrideAuditMaxLines+overflow; i++ {
+		recorder.recordOperation("replace", fmt.Sprintf("messages.%d.role", i), "system", "user", nil)
+	}
+	require.Len(t, recorder.lines, paramOverrideAuditMaxLines)
+	assert.Equal(t, overflow, recorder.truncated)
+
+	// 重复行不计入截断数，仍按去重处理
+	deduped := &paramOverrideAuditRecorder{}
+	for i := 0; i < paramOverrideAuditMaxLines+overflow; i++ {
+		deduped.recordOperation("replace", "messages.0.role", "system", "user", nil)
+	}
+	require.Len(t, deduped.lines, 1)
+	assert.Equal(t, 0, deduped.truncated)
+}
+
 func TestApplyParamOverrideSetWildcardKeepOrigin(t *testing.T) {
 	input := []byte(`{"tools":[{"custom":{"tag":"A"}},{"custom":{"tag":"B","enabled":false}},{"custom":{"tag":"C"}}]}`)
 	override := map[string]interface{}{
