@@ -138,3 +138,61 @@ func mustResponsesEventsFromChatChunk(t *testing.T, state *ChatToResponsesStream
 	require.NoError(t, err)
 	return events
 }
+
+func TestChatCompletionsResponseToResponsesAlwaysExposesInputTokensDetails(t *testing.T) {
+	tests := []struct {
+		name             string
+		usage            dto.Usage
+		wantCachedTokens int
+	}{
+		{
+			name:             "fallback to prompt cache hit tokens",
+			usage:            dto.Usage{PromptTokens: 10, CompletionTokens: 5, TotalTokens: 15, PromptCacheHitTokens: 12},
+			wantCachedTokens: 12,
+		},
+		{
+			name:             "no cache info still emits details object",
+			usage:            dto.Usage{PromptTokens: 3, CompletionTokens: 1, TotalTokens: 4},
+			wantCachedTokens: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, usage, err := ChatCompletionsResponseToResponsesResponse(&dto.OpenAITextResponse{
+				Id: "chatcmpl_1",
+				Choices: []dto.OpenAITextResponseChoice{
+					{Message: dto.Message{Role: "assistant", Content: "hi"}, FinishReason: "stop"},
+				},
+				Usage: tt.usage,
+			}, "resp_1")
+			require.NoError(t, err)
+
+			require.NotNil(t, usage.InputTokensDetails)
+			assert.Equal(t, tt.wantCachedTokens, usage.InputTokensDetails.CachedTokens)
+		})
+	}
+}
+
+func TestChatCompletionsResponseToResponsesPutsReasoningIntoSummary(t *testing.T) {
+	reasoning := "think first"
+	resp, _, err := ChatCompletionsResponseToResponsesResponse(&dto.OpenAITextResponse{
+		Id:    "chatcmpl_1",
+		Model: "deepseek-v4.1-flash",
+		Choices: []dto.OpenAITextResponseChoice{
+			{
+				Message:      dto.Message{Role: "assistant", Content: "answer", ReasoningContent: &reasoning},
+				FinishReason: "stop",
+			},
+		},
+	}, "resp_1")
+	require.NoError(t, err)
+
+	require.Len(t, resp.Output, 2)
+	assert.Equal(t, responsesOutputTypeMessage, resp.Output[0].Type)
+	assert.Equal(t, responsesOutputTypeReasoning, resp.Output[1].Type)
+	assert.Empty(t, resp.Output[1].Content)
+	require.Len(t, resp.Output[1].Summary, 1)
+	assert.Equal(t, "summary_text", resp.Output[1].Summary[0].Type)
+	assert.Equal(t, "think first", resp.Output[1].Summary[0].Text)
+}

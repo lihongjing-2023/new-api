@@ -219,13 +219,30 @@ func ExtractReasoningTextFromResponses(resp *dto.OpenAIResponsesResponse) string
 		if out.Type != responsesOutputTypeReasoning {
 			continue
 		}
-		for _, c := range out.Content {
-			if c.Text != "" {
-				sb.WriteString(c.Text)
-			}
-		}
+		sb.WriteString(reasoningOutputText(out))
 	}
 	return sb.String()
+}
+
+// reasoningOutputText 读取 reasoning item 的思考文本：优先规范字段 summary，
+// 兼容仍把文本放在 content 里的历史/第三方响应。
+func reasoningOutputText(out dto.ResponsesOutput) string {
+	var summary strings.Builder
+	for _, c := range out.Summary {
+		if c.Text != "" {
+			summary.WriteString(c.Text)
+		}
+	}
+	if summary.Len() > 0 {
+		return summary.String()
+	}
+	var content strings.Builder
+	for _, c := range out.Content {
+		if c.Text != "" {
+			content.WriteString(c.Text)
+		}
+	}
+	return content.String()
 }
 
 func responseStatusString(resp *dto.OpenAIResponsesResponse) string {

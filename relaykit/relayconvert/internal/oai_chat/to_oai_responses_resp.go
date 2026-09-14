@@ -77,7 +77,7 @@ func ChatCompletionsResponseToResponsesResponse(resp *dto.OpenAITextResponse, id
 			Type:   responsesOutputTypeReasoning,
 			ID:     fmt.Sprintf("%s_reasoning_0", id),
 			Status: responseOutputStatus(out),
-			Content: []dto.ResponsesOutputContent{
+			Summary: []dto.ResponsesOutputContent{
 				{
 					Type: "summary_text",
 					Text: reasoning,
@@ -133,15 +133,14 @@ func UsageFromChatUsage(src *dto.Usage) *dto.Usage {
 	} else {
 		usage.TotalTokens = usage.InputTokens + usage.OutputTokens
 	}
-	if src.PromptTokensDetails.CachedTokens != 0 ||
-		src.PromptTokensDetails.ImageTokens != 0 ||
-		src.PromptTokensDetails.AudioTokens != 0 ||
-		src.PromptTokensDetails.CachedCreationTokens != 0 ||
-		src.PromptTokensDetails.CacheWriteTokens != 0 ||
-		src.PromptTokensDetails.TextTokens != 0 {
-		details := src.PromptTokensDetails
-		usage.InputTokensDetails = &details
+	// Responses 客户端（Codex 等）始终读取 usage.input_tokens_details.cached_tokens，
+	// 因此这里必须输出该对象，而不是仅在明细非零时输出；DeepSeek 风格上游只给
+	// prompt_cache_hit_tokens 时回退填充，避免缓存命中在转换层被吞掉。
+	details := src.PromptTokensDetails
+	if details.CachedTokens == 0 && src.PromptCacheHitTokens > 0 {
+		details.CachedTokens = src.PromptCacheHitTokens
 	}
+	usage.InputTokensDetails = &details
 	if src.CompletionTokenDetails.ReasoningTokens != 0 ||
 		src.CompletionTokenDetails.TextTokens != 0 ||
 		src.CompletionTokenDetails.AudioTokens != 0 ||
