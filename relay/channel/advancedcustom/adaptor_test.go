@@ -794,6 +794,56 @@ func TestAdaptorConvertsClaudeRequestToOpenAIChatUpstream(t *testing.T) {
 	assert.Equal(t, "user", chatReq.Messages[0].Role)
 }
 
+// 渠道级旧版角色兼容开关在高级自定义渠道上必须同样生效：
+// Claude Messages 经 converter 转成 OpenAI chat 后交给 openai 适配器统一改写角色。
+func TestAdaptorLegacyRoleCompatRewritesRolesForOpenAIChatUpstream(t *testing.T) {
+	convertRoles := func(t *testing.T, enabled bool) []string {
+		t.Helper()
+		adaptor := &Adaptor{}
+		info := advancedCustomRelayInfo(&dto.AdvancedCustomConfig{
+			Routes: []dto.AdvancedCustomRoute{
+				{
+					IncomingPath: "/v1/messages",
+					UpstreamPath: "/v1/chat/completions",
+					Converter:    relayconvert.ConverterClaudeMessagesToOpenAIChat,
+				},
+			},
+		})
+		info.ChannelSetting = dto.ChannelSettings{LegacyRoleCompat: enabled}
+		info.RelayFormat = types.RelayFormatClaude
+		info.RequestURLPath = "/v1/messages"
+		c := advancedCustomGinContext("/v1/messages")
+
+		converted, err := adaptor.ConvertClaudeRequest(c, info, &dto.ClaudeRequest{
+			Model:  "gpt-test",
+			System: "keep it short",
+			Messages: []dto.ClaudeMessage{
+				{Role: "user", Content: "hello"},
+				{Role: "assistant", Content: "hi"},
+				{Role: "user", Content: "again"},
+			},
+		})
+		require.NoError(t, err)
+
+		chatReq, ok := converted.(*dto.GeneralOpenAIRequest)
+		require.True(t, ok)
+		roles := make([]string, 0, len(chatReq.Messages))
+		for _, message := range chatReq.Messages {
+			roles = append(roles, message.Role)
+		}
+		return roles
+	}
+
+	disabledRoles := convertRoles(t, false)
+	require.Contains(t, disabledRoles, "system")
+
+	enabledRoles := convertRoles(t, true)
+	assert.NotContains(t, enabledRoles, "system")
+	assert.NotContains(t, enabledRoles, "developer")
+	assert.Contains(t, enabledRoles, "assistant")
+	assert.Equal(t, len(disabledRoles), len(enabledRoles))
+}
+
 func TestAdaptorConvertsGeminiRequestToOpenAIChatUpstream(t *testing.T) {
 	adaptor := &Adaptor{}
 	info := advancedCustomRelayInfo(&dto.AdvancedCustomConfig{
