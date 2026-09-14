@@ -13,6 +13,7 @@ import (
 type ChannelSettings struct {
 	ForceFormat            bool   `json:"force_format,omitempty"`
 	ThinkingToContent      bool   `json:"thinking_to_content,omitempty"`
+	LegacyRoleCompat       bool   `json:"legacy_role_compat,omitempty"` // 旧版角色兼容：developer 与 system 全部改写为 user
 	Proxy                  string `json:"proxy"`
 	PassThroughBodyEnabled bool   `json:"pass_through_body_enabled,omitempty"`
 	SystemPrompt           string `json:"system_prompt,omitempty"`

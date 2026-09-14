@@ -363,6 +363,11 @@ func (a *Adaptor) ConvertOpenAIRequest(c *gin.Context, info *relaycommon.RelayIn
 		}
 	}
 
+	// 渠道开启旧版角色兼容时，最后统一改写角色（压过上面的 o 系列 system->developer 适配）
+	if info.ChannelSetting.LegacyRoleCompat {
+		applyLegacyRoleCompat(request)
+	}
+
 	return request, nil
 }
 
