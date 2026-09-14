@@ -434,9 +434,32 @@ func RequestTextToChatResponseFormat(raw json.RawMessage) (*dto.ResponseFormat, 
 }
 
 func responsesImagePartToChatImageURL(part map[string]any) any {
+	detail := kitutil.Interface2String(part["detail"])
+
 	if imageURL, ok := part["image_url"]; ok {
-		return imageURL
+		switch v := imageURL.(type) {
+		case string:
+			// Responses 的 input_image.image_url 是字符串，chat 规范要求对象
+			// {"url": ...}；detail 也从 part 级搬进对象内，否则会丢失。
+			out := map[string]any{"url": v}
+			if detail != "" {
+				out["detail"] = detail
+			}
+			return out
+		case map[string]any:
+			out := make(map[string]any, len(v)+1)
+			for key, value := range v {
+				out[key] = value
+			}
+			if _, exists := out["detail"]; !exists && detail != "" {
+				out["detail"] = detail
+			}
+			return out
+		default:
+			return imageURL
+		}
 	}
+
 	imageURL := map[string]any{}
 	for _, key := range []string{"url", "file_id", "detail"} {
 		if value, ok := part[key]; ok {

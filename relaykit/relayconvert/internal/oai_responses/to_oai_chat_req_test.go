@@ -120,6 +120,15 @@ func TestResponsesRequestToChatCompletionsRequestMultimodalInput(t *testing.T) {
 	assert.Equal(t, "wav", parts[3].GetInputAudio().Format)
 	assert.Equal(t, dto.ContentTypeVideoUrl, parts[4].Type)
 	assert.Equal(t, "https://example.test/v.mp4", parts[4].GetVideoUrl().Url)
+
+	// 上游按 chat 规范解析 image_url 对象；字符串形态会被严格网关以
+	// "cannot unmarshal string into Go value of type ImageContent" 拒绝。
+	encoded, err := kitutil.Marshal(got)
+	require.NoError(t, err)
+	imageURL := gjson.GetBytes(encoded, `messages.0.content.1.image_url`)
+	require.True(t, imageURL.IsObject())
+	assert.Equal(t, "https://example.test/a.png", imageURL.Get("url").String())
+	assert.Equal(t, "low", imageURL.Get("detail").String())
 }
 
 func TestResponsesRequestToChatCompletionsRequestAssistantTextAndFunctionCallCoexist(t *testing.T) {
