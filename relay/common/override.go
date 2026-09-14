@@ -1812,8 +1812,17 @@ func applyToSegmentGroups(data []byte, segPaths [][]string, fn func([]byte, stri
 	// 数组快速路径：子分组全部是基于数组下标时单次遍历完成，
 	// 避免对 messages 这种长数组按下标逐个 gjson 定位的 O(n²) 扫描。
 	if array := gjson.ParseBytes(data); array.IsArray() {
-		if next, handled, arrayErr := applyToArrayElementGroups(array, groups, fn); handled || arrayErr != nil {
-			return next, arrayErr
+		next, handled, arrayErr := applyToArrayElementGroups(array, groups, fn)
+		if arrayErr != nil {
+			return nil, arrayErr
+		}
+		if handled {
+			// next == nil 表示数组整体无变化，直接返回当前 data
+			//（含本级叶子改动），不复制数组 raw。
+			if next == nil {
+				return data, nil
+			}
+			return next, nil
 		}
 	}
 
@@ -1833,6 +1842,13 @@ func applyToSegmentGroups(data []byte, segPaths [][]string, fn func([]byte, stri
 		next, applyErr := applyToSegmentGroups([]byte(child.Raw), group.child, fn)
 		if applyErr != nil {
 			return nil, applyErr
+		}
+		// 脏检查：子树没有任何实际变化时跳过写回，避免对
+		// 大 body 做无谓的整包拷贝（如 Claude Code 流量转换后
+		// 根本不含 developer/非首 system，replace 全部空转）。
+		// string(next) == raw 走编译器免分配优化，不复制数组 raw。
+		if string(next) == child.Raw {
+			continue
 		}
 		data, err = sjson.SetRawBytes(data, group.key, next)
 		if err != nil {
@@ -1860,12 +1876,22 @@ func applyToArrayElementGroups(array gjson.Result, groups []wildcardSegmentGroup
 	}
 
 	replacements := make(map[int][]byte, len(work))
+	dirty := false
 	for _, item := range work {
 		next, applyErr := applyToSegmentGroups([]byte(elements[item.index].Raw), item.child, fn)
 		if applyErr != nil {
 			return nil, true, applyErr
 		}
+		// 脏检查：元素无变化时不记录替换，全部无变化时返回
+		// nil 哨兵，跳过整个数组的重建与写回。
+		if string(next) == elements[item.index].Raw {
+			continue
+		}
 		replacements[item.index] = next
+		dirty = true
+	}
+	if !dirty {
+		return nil, true, nil
 	}
 
 	var builder strings.Builder
@@ -1957,11 +1983,15 @@ func trimStringValue(data []byte, path string, value interface{}, isPrefix bool)
 	}
 	valueStr := fmt.Sprintf("%v", value)
 
+	currentStr := current.String()
 	var newStr string
 	if isPrefix {
-		newStr = strings.TrimPrefix(current.String(), valueStr)
+		newStr = strings.TrimPrefix(currentStr, valueStr)
 	} else {
-		newStr = strings.TrimSuffix(current.String(), valueStr)
+		newStr = strings.TrimSuffix(currentStr, valueStr)
+	}
+	if newStr == currentStr {
+		return data, nil
 	}
 	return sjson.SetBytes(data, path, newStr)
 }
@@ -1999,7 +2029,12 @@ func transformStringValue(data []byte, path string, transform func(string) strin
 	if current.Type != gjson.String {
 		return data, fmt.Errorf("operation not supported for type: %v", current.Type)
 	}
-	return sjson.SetBytes(data, path, transform(current.String()))
+	currentStr := current.String()
+	nextStr := transform(currentStr)
+	if nextStr == currentStr {
+		return data, nil
+	}
+	return sjson.SetBytes(data, path, nextStr)
 }
 
 func logParamOverrideOpError(op, path string, current gjson.Result, data []byte) {
@@ -2015,7 +2050,12 @@ func replaceStringValue(data []byte, path, from, to string) ([]byte, error) {
 	if from == "" {
 		return data, fmt.Errorf("replace from is required")
 	}
-	return sjson.SetBytes(data, path, strings.ReplaceAll(current.String(), from, to))
+	currentStr := current.String()
+	nextStr := strings.ReplaceAll(currentStr, from, to)
+	if nextStr == currentStr {
+		return data, nil
+	}
+	return sjson.SetBytes(data, path, nextStr)
 }
 
 func regexReplaceStringValue(data []byte, path string, pattern *regexp.Regexp, replacement string) ([]byte, error) {
@@ -2024,7 +2064,12 @@ func regexReplaceStringValue(data []byte, path string, pattern *regexp.Regexp, r
 		logParamOverrideOpError("regex_replace", path, current, data)
 		return data, fmt.Errorf("operation not supported for type: %v", current.Type)
 	}
-	return sjson.SetBytes(data, path, pattern.ReplaceAllString(current.String(), replacement))
+	currentStr := current.String()
+	nextStr := pattern.ReplaceAllString(currentStr, replacement)
+	if nextStr == currentStr {
+		return data, nil
+	}
+	return sjson.SetBytes(data, path, nextStr)
 }
 
 type pruneObjectsOptions struct {

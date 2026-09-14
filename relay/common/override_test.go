@@ -521,6 +521,24 @@ func TestParamOverrideAuditRecorderCapsLines(t *testing.T) {
 	assert.Equal(t, 0, deduped.truncated)
 }
 
+// 脏检查契约：replace 未命中任何值时，请求体必须逐字节保持不变。
+// 某些上游对 body 做签名校验，逐字节透传是用户可见行为；同时
+// 空转扫描不应触发数组重建与整包拷贝。5 条消息覆盖数组快速路径
+// （路径数 >= pathBatchThreshold）。
+func TestApplyParamOverrideReplaceNoMatchKeepsBodyByteIdentical(t *testing.T) {
+	input := []byte(`{"model":"gpt-4","messages":[{"role":"user","content":"a"},{"role":"assistant","content":"b"},{"role":"user","content":"c"},{"role":"assistant","content":"d"},{"role":"user","content":"e"}]}`)
+	override := map[string]interface{}{
+		"operations": []interface{}{
+			map[string]interface{}{"mode": "replace", "path": "messages.*.role", "from": "developer", "to": "user"},
+			map[string]interface{}{"mode": "replace", "path": "messages.*.role", "from": "system", "to": "user"},
+		},
+	}
+
+	out, err := ApplyParamOverride(input, override, nil)
+	require.NoError(t, err)
+	assert.Equal(t, string(input), string(out))
+}
+
 func TestApplyParamOverrideSetWildcardKeepOrigin(t *testing.T) {
 	input := []byte(`{"tools":[{"custom":{"tag":"A"}},{"custom":{"tag":"B","enabled":false}},{"custom":{"tag":"C"}}]}`)
 	override := map[string]interface{}{
